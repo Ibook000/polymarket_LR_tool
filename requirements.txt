@@ -1,0 +1,4 @@
+# Pin to current PyPI release; see https://github.com/Polymarket/py-clob-client
+py-clob-client==0.34.6
+websockets>=12.0
+python-dotenv>=1.0.0
