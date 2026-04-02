@@ -98,6 +98,9 @@ class PassiveConfig:
     replace_post_max_retries: int = 0
     # Comma-separated CLOB outcome token_ids (asset_id). Empty = no automatic management.
     token_whitelist: frozenset[str] = field(default_factory=frozenset)
+    # When token_whitelist is empty: recompute allowed token_ids from open orders this often (seconds).
+    # <= 0 disables periodic refresh (startup seed only). Default 120 = 2 minutes.
+    whitelist_refresh_interval_sec: float = 120.0
     # Manage whitelisted tokens only while abs(position) <= this; above = manual mode (no touch).
     inventory_manual_threshold: float = 0.01
     # Second-level structural risk (only risky orders when token danger exposure is high).
@@ -159,6 +162,13 @@ class PassiveConfig:
     alert_significant_fill_risk_delta: float = 0.08
     alert_significant_adverse_share_delta: float = 0.07
     alert_significant_depth_ratio_delta: float = 0.05
+    # WebSocket monitoring (optional; REST remains source of truth for execution).
+    ws_enabled: bool = True
+    ws_user_enabled: bool = True
+    ws_market_enabled: bool = True
+    ws_stale_sec: float = 25.0
+    ws_reconcile_every_loops: int = 15
+    ws_telegram_transport_alerts: bool = True
 
     @classmethod
     def from_env(cls) -> PassiveConfig:
@@ -306,6 +316,9 @@ class PassiveConfig:
                 "PASSIVE_REPLACE_POST_MAX_RETRIES", cls.replace_post_max_retries
             ),
             token_whitelist=_parse_token_whitelist(os.environ.get("PASSIVE_TOKEN_WHITELIST")),
+            whitelist_refresh_interval_sec=f(
+                "PASSIVE_WHITELIST_REFRESH_SEC", cls.whitelist_refresh_interval_sec
+            ),
             inventory_manual_threshold=f(
                 "PASSIVE_INV_MANUAL_THRESHOLD", cls.inventory_manual_threshold
             ),
@@ -442,5 +455,16 @@ class PassiveConfig:
             alert_significant_depth_ratio_delta=f(
                 "PASSIVE_ALERT_SIG_DEPTH_RATIO_DELTA",
                 cls.alert_significant_depth_ratio_delta,
+            ),
+            ws_enabled=b("PASSIVE_WS_ENABLED", cls.ws_enabled),
+            ws_user_enabled=b("PASSIVE_WS_USER_ENABLED", cls.ws_user_enabled),
+            ws_market_enabled=b("PASSIVE_WS_MARKET_ENABLED", cls.ws_market_enabled),
+            ws_stale_sec=f("PASSIVE_WS_STALE_SEC", cls.ws_stale_sec),
+            ws_reconcile_every_loops=i(
+                "PASSIVE_WS_RECONCILE_LOOPS", cls.ws_reconcile_every_loops
+            ),
+            ws_telegram_transport_alerts=b(
+                "PASSIVE_WS_TELEGRAM_TRANSPORT",
+                cls.ws_telegram_transport_alerts,
             ),
         )

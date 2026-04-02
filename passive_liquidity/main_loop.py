@@ -39,6 +39,9 @@ from passive_liquidity.order_manager import (
 )
 from passive_liquidity.models import OrderBookSnapshot
 from passive_liquidity.orderbook_fetcher import OrderBookFetcher
+from passive_liquidity.polymarket_ws_market import PolymarketMarketWsThread
+from passive_liquidity.polymarket_ws_state import PolymarketWsHub
+from passive_liquidity.polymarket_ws_user import PolymarketUserWsThread
 from passive_liquidity.reward_monitor import RewardMonitor
 from passive_liquidity.risk_manager import RiskManager
 from passive_liquidity.simple_price_policy import (
@@ -139,26 +142,32 @@ def _telegram_order_event(
     tg.send_message(text, event_key=event_key, payload_hash=fp)
 
 
+def _token_ids_from_open_orders(open_orders: list) -> frozenset[str]:
+    """Unique outcome token_ids from CLOB open orders (same validity rules as startup seed)."""
+    return frozenset(
+        _token_id(o)
+        for o in open_orders
+        if isinstance(o, dict) and _oid(o) and _token_id(o) and _market(o)
+    )
+
+
 def _resolve_initial_frozen_whitelist(
     client,
     order_manager: OrderManager,
     env_whitelist: frozenset[str],
 ) -> tuple[frozenset[str], str, Optional[int]]:
     """
-    Build the process-lifetime whitelist.
+    Initial whitelist before the main loop.
 
-    - If PASSIVE_TOKEN_WHITELIST (env) is non-empty: use it (frozen).
-    - Else: unique token_ids from a one-time fetch of open orders at startup (frozen).
+    - If PASSIVE_TOKEN_WHITELIST (env) is non-empty: use it (fixed for process; no API refresh).
+    - Else: unique token_ids from open orders at startup; then refreshed periodically in main
+      (see PASSIVE_WHITELIST_REFRESH_SEC) from current open orders.
     Returns (whitelist, source_label, open_order_count when seeded from orders else None).
     """
     if env_whitelist:
         return (frozenset(env_whitelist), "PASSIVE_TOKEN_WHITELIST", None)
     seed_orders = order_manager.fetch_all_open_orders(client)
-    tokens = frozenset(
-        _token_id(o)
-        for o in seed_orders
-        if isinstance(o, dict) and _oid(o) and _token_id(o) and _market(o)
-    )
+    tokens = _token_ids_from_open_orders(seed_orders)
     return (tokens, "open_orders_at_startup", len(seed_orders))
 
 
@@ -172,11 +181,11 @@ def main() -> None:
         LOG.info("Telegram notifications disabled or misconfigured")
 
     print(
-        "白名单监控：启动时固定白名单（见下方）。运行期间出现的新 token_id 一律忽略。\n"
-        "· 若设置了 PASSIVE_TOKEN_WHITELIST：以其为准。\n"
-        "· 否则：从启动当刻的未成交单中提取唯一 token_id 作为白名单。\n"
-        "调价仅按简化规则（粗 tick 盘口档位 / 细 tick 带宽比例）；不会新建订单。\n"
-        "若该 outcome 已有仓位（库存非零），则不对该盘口挂单做任何处理（不撤单、不改价、不参与监控逻辑）。\n",
+        "白名单监控（见下方）。若该 outcome 已有仓位（库存非零），则整 token 跳过（不调价、不撤单、不进主逻辑）。\n"
+        "· 若设置了 PASSIVE_TOKEN_WHITELIST：仅以环境变量为准，运行中不随未成交单扩容。\n"
+        "· 否则：从当前未成交单提取 token_id；并按 PASSIVE_WHITELIST_REFRESH_SEC（默认 120s）"
+        "周期性用未成交单刷新，启动后新挂的单可被纳入。\n"
+        "调价仅按简化规则；不会新建订单。\n",
         flush=True,
     )
 
@@ -196,17 +205,28 @@ def main() -> None:
     frozen_whitelist, wl_source, seed_order_n = _resolve_initial_frozen_whitelist(
         client, order_manager, config.token_whitelist
     )
+    # When not using env whitelist, token set is refreshed from open orders periodically.
+    dynamic_whitelist: frozenset[str] = frozenset(frozen_whitelist)
+    last_whitelist_refresh_mono = time.monotonic()
 
     seed_part = (
         f"open_orders_seen={seed_order_n}"
         if seed_order_n is not None
         else "open_orders_seen=n/a (whitelist from env)"
     )
+    refresh_note = ""
+    if not config.token_whitelist:
+        iv = float(config.whitelist_refresh_interval_sec)
+        refresh_note = (
+            f" refresh_open_orders_sec={iv:g} (<=0 means startup seed only)"
+            if iv > 0
+            else " refresh=disabled (startup seed only)"
+        )
     LOG.info(
-        "=== INITIAL WHITELIST (frozen for this process) === source=%s %s "
-        "unique_token_count=%d inv_threshold=%.6f ===",
+        "=== INITIAL WHITELIST === source=%s %s %s unique_token_count=%d inv_threshold=%.6f ===",
         wl_source,
         seed_part,
+        refresh_note.strip(),
         len(frozen_whitelist),
         config.inventory_manual_threshold,
     )
@@ -215,8 +235,8 @@ def main() -> None:
             LOG.info("WHITELIST token_id=%s", tid)
     else:
         LOG.warning(
-            "Initial whitelist is EMPTY — no token_ids will be managed until you restart "
-            "after placing orders (or set PASSIVE_TOKEN_WHITELIST)."
+            "Initial whitelist is EMPTY — place orders or set PASSIVE_TOKEN_WHITELIST; "
+            "when not using env whitelist, open-order refresh will add tokens once orders exist."
         )
 
     seed_note = (
@@ -224,9 +244,12 @@ def main() -> None:
         if seed_order_n is not None
         else "（白名单来自环境变量，未按挂单推断）"
     )
+    dyn_note = ""
+    if not config.token_whitelist and config.whitelist_refresh_interval_sec > 0:
+        dyn_note = f" 未成交单刷新间隔={config.whitelist_refresh_interval_sec:g}s"
     print(
         f"【启动白名单】来源={wl_source} {seed_note} 唯一 token 数={len(frozen_whitelist)} "
-        f"库存门槛={config.inventory_manual_threshold}\n",
+        f"库存门槛={config.inventory_manual_threshold}{dyn_note}\n",
         flush=True,
     )
     if frozen_whitelist:
@@ -234,7 +257,10 @@ def main() -> None:
             print(f"  · {tid}", flush=True)
         print("", flush=True)
     else:
-        print("  （空）之后新挂的单不会自动加入白名单；需重启或配置 PASSIVE_TOKEN_WHITELIST。\n", flush=True)
+        if not config.token_whitelist and config.whitelist_refresh_interval_sec > 0:
+            print("  （空）有未成交单后会在刷新周期内自动加入白名单。\n", flush=True)
+        else:
+            print("  （空）请挂单或配置 PASSIVE_TOKEN_WHITELIST。\n", flush=True)
 
     if telegram.enabled:
         telegram.notify_whitelist_init(
@@ -353,10 +379,161 @@ def main() -> None:
         1.0, float(config.telegram_band_summary_interval_sec)
     )
 
+    class _WsSubRef:
+        __slots__ = ("markets", "tokens")
+
+        def __init__(self) -> None:
+            self.markets: list[str] = []
+            self.tokens: list[str] = []
+
+    ws_hub: Optional[PolymarketWsHub] = None
+    ws_sub = _WsSubRef()
+    user_ws_thread: Optional[PolymarketUserWsThread] = None
+    market_ws_thread: Optional[PolymarketMarketWsThread] = None
+    if config.ws_enabled:
+        ws_hub = PolymarketWsHub(stale_sec=config.ws_stale_sec)
+        creds = getattr(client, "creds", None)
+        if config.ws_user_enabled and creds is not None:
+            user_ws_thread = PolymarketUserWsThread(
+                ws_hub,
+                api_key=creds.api_key,
+                api_secret=creds.api_secret,
+                api_passphrase=creds.api_passphrase,
+                get_markets=lambda: list(ws_sub.markets),
+            )
+            user_ws_thread.start()
+            LOG.info("PASSIVE WebSocket user channel thread started")
+        elif config.ws_user_enabled:
+            LOG.warning(
+                "PASSIVE_WS_USER_ENABLED but trading client has no API creds; user WS skipped"
+            )
+        if config.ws_market_enabled:
+            market_ws_thread = PolymarketMarketWsThread(
+                ws_hub,
+                get_asset_ids=lambda: list(ws_sub.tokens),
+            )
+            market_ws_thread.start()
+            LOG.info("PASSIVE WebSocket market channel thread started")
+    else:
+        LOG.info("PASSIVE_WS_ENABLED=0 — WebSocket monitoring disabled")
+
+    prev_user_ws_connected = False
+    prev_market_ws_connected = False
+    main_loop_cycle = 0
+
     while True:
         try:
             orders = order_manager.fetch_all_open_orders(client)
             now = time.time()
+            now_mono = time.monotonic()
+            if config.token_whitelist:
+                effective_whitelist: frozenset[str] = frozenset(config.token_whitelist)
+            else:
+                interval = float(config.whitelist_refresh_interval_sec)
+                tokens_now = _token_ids_from_open_orders(orders)
+                due_by_timer = interval > 0 and (now_mono - last_whitelist_refresh_mono) >= interval
+                due_if_empty = (not dynamic_whitelist) and bool(tokens_now)
+                if due_by_timer or due_if_empty:
+                    new_wl = tokens_now
+                    if new_wl != dynamic_whitelist:
+                        added = new_wl - dynamic_whitelist
+                        removed = dynamic_whitelist - new_wl
+                        if due_if_empty and not due_by_timer:
+                            LOG.info(
+                                "Whitelist seeded from open orders (immediate): %d token(s)",
+                                len(new_wl),
+                            )
+                        else:
+                            LOG.info(
+                                "Whitelist refreshed from open orders (interval=%.0fs): %d -> %d token(s)",
+                                interval if interval > 0 else 0.0,
+                                len(dynamic_whitelist),
+                                len(new_wl),
+                            )
+                        for tid in sorted(added):
+                            LOG.info("WHITELIST +token_id=%s", tid)
+                        for tid in sorted(removed):
+                            LOG.info("WHITELIST -token_id=%s (no matching open orders)", tid)
+                    dynamic_whitelist = new_wl
+                    last_whitelist_refresh_mono = now_mono
+                effective_whitelist = dynamic_whitelist
+
+            main_loop_cycle += 1
+            if ws_hub is not None:
+                ws_sub.tokens = sorted(effective_whitelist)
+                if orders:
+                    ws_sub.markets = sorted(
+                        {
+                            str(_market(o))
+                            for o in orders
+                            if isinstance(o, dict)
+                            and _market(o)
+                            and _token_id(o) in effective_whitelist
+                        }
+                    )
+                else:
+                    ws_sub.markets = []
+                n_rec = max(1, int(config.ws_reconcile_every_loops))
+                if orders and main_loop_cycle % n_rec == 0:
+                    ws_hub.reconcile_user_orders_with_rest(orders)
+                    ws_hub.prune_user_orders_not_in(
+                        {
+                            str(_oid(o))
+                            for o in orders
+                            if isinstance(o, dict) and _oid(o)
+                        }
+                    )
+
+            if (
+                ws_hub is not None
+                and telegram.enabled
+                and config.ws_telegram_transport_alerts
+            ):
+                uc = ws_hub.user_connected_flag()
+                if uc != prev_user_ws_connected:
+                    if uc:
+                        telegram.notify_ws_transport_zh(
+                            title_zh="WebSocket：用户通道已连接",
+                            lines=[
+                                "推送：本账户订单/成交（监控与成交通知）；"
+                                "撤单/改价仍只由主循环 REST 执行。"
+                            ],
+                            event_key="ws:user:connected",
+                        )
+                    else:
+                        dbg = ws_hub.connection_debug()
+                        telegram.notify_ws_transport_zh(
+                            title_zh="WebSocket：用户通道已断开",
+                            lines=[
+                                "已使用 REST 成交检测；主循环照常运行。",
+                                f"last_error={dbg.get('user_error') or '—'}",
+                            ],
+                            event_key="ws:user:disconnected",
+                        )
+                prev_user_ws_connected = uc
+                mc = ws_hub.market_connected_flag()
+                if mc != prev_market_ws_connected:
+                    if mc:
+                        telegram.notify_ws_transport_zh(
+                            title_zh="WebSocket：行情通道已连接",
+                            lines=[
+                                "推送：盘口/成交活动（监控用）；"
+                                "陈旧或断线时自动回退 REST。"
+                            ],
+                            event_key="ws:market:connected",
+                        )
+                    else:
+                        dbg = ws_hub.connection_debug()
+                        telegram.notify_ws_transport_zh(
+                            title_zh="WebSocket：行情通道已断开",
+                            lines=[
+                                "盘口深度与成交活动监控回退 REST。",
+                                f"last_error={dbg.get('market_error') or '—'}",
+                            ],
+                            event_key="ws:market:disconnected",
+                        )
+                prev_market_ws_connected = mc
+
             band_summary_rows: list[dict[str, Any]] = []
             band_summary_eligible_n = 0
             if telegram.enabled and now >= next_summary_at:
@@ -418,7 +595,7 @@ def main() -> None:
                         LOG.warning("Skip order with missing id/market/asset: %s", o)
                         continue
 
-                    if token_id not in frozen_whitelist:
+                    if token_id not in effective_whitelist:
                         continue
 
                     if token_id not in inv_by_token:
@@ -440,7 +617,7 @@ def main() -> None:
 
                     eligible_orders.append(o)
 
-                if frozen_whitelist and orders and not eligible_orders:
+                if effective_whitelist and orders and not eligible_orders:
                     LOG.debug(
                         "No eligible orders this cycle (%d open): all non-whitelist or holding position",
                         len(orders),
@@ -448,7 +625,7 @@ def main() -> None:
 
                 ids = [_oid(o) for o in eligible_orders if _oid(o)]
                 scoring_map = reward_monitor.batch_order_scoring(client, ids)
-                book_cache: dict[str, OrderBookSnapshot] = {}
+                book_cache: dict[str, dict[str, Any]] = {}
                 tokens_for_trades = {
                     _token_id(o) for o in eligible_orders if _token_id(o)
                 }
@@ -481,6 +658,7 @@ def main() -> None:
                         scoring_status_text_s=scoring_status_text(kw["scoring"]),
                         fill_price=kw.get("fill_price"),
                         inventory=float(kw["inventory"]),
+                        fill_detection_source=kw.get("fill_detection_source"),
                     )
                     fp = stable_fingerprint(
                         kw["order_id"],
@@ -488,7 +666,11 @@ def main() -> None:
                     )
                     oid_key = str(kw["order_id"])[:48].replace(":", "_")
                     cum_tag = int(round(float(kw["dedupe_total_filled"]) * 1_000_000))
-                    LOG.info("Telegram fill notify order=%s", kw["order_id"][:18])
+                    LOG.info(
+                        "Telegram fill notify order=%s fill_detection_source=%s",
+                        kw["order_id"][:18],
+                        kw.get("fill_detection_source") or "rest",
+                    )
                     telegram.send_message(
                         text,
                         event_key=f"fill:order:{oid_key}:{cum_tag}",
@@ -504,6 +686,7 @@ def main() -> None:
                     now=now,
                     get_inventory=lambda c_id, t_id: risk.get_inventory(c_id, t_id),
                     send_fill_telegram=_send_fill_telegram,
+                    ws_hub=ws_hub,
                 )
 
                 cycle_rows: list[dict[str, Any]] = []
@@ -515,8 +698,44 @@ def main() -> None:
                         continue
 
                     if token_id not in book_cache:
-                        book_cache[token_id] = book_fetcher.get_orderbook(token_id)
-                    book = book_cache[token_id]
+                        book_rest = book_fetcher.get_orderbook(token_id)
+                        book_i = book_rest
+                        depth_src = "rest"
+                        tick_src = "rest"
+                        if ws_hub is not None:
+                            if ws_hub.market_stale(token_id):
+                                LOG.debug(
+                                    "MONITOR token=%s market_ws_stale=1 using REST book",
+                                    token_id[:28],
+                                )
+                            else:
+                                wob = ws_hub.orderbook_from_ws(token_id)
+                                if wob is not None and (
+                                    len(wob.bids) + len(wob.asks) > 0
+                                ):
+                                    book_i = wob
+                                    depth_src = "ws_market"
+                                wtick = ws_hub.get_market_tick_size(token_id)
+                                if wtick is not None:
+                                    tick_src = "ws_market"
+                                    book_i = OrderBookSnapshot(
+                                        best_bid=book_i.best_bid,
+                                        best_ask=book_i.best_ask,
+                                        tick_size=float(wtick),
+                                        neg_risk=book_i.neg_risk,
+                                        bids=book_i.bids,
+                                        asks=book_i.asks,
+                                        raw=book_i.raw,
+                                    )
+                        book_cache[token_id] = {
+                            "book": book_i,
+                            "depth_source": depth_src,
+                            "tick_source": tick_src,
+                        }
+                    bentry = book_cache[token_id]
+                    book = bentry["book"]
+                    depth_src = str(bentry["depth_source"])
+                    tick_src = str(bentry["tick_source"])
                     mid = book.mid
                     if mid is None:
                         mid = book_fetcher.mid_price(token_id)
@@ -530,7 +749,9 @@ def main() -> None:
                     delta = max(reward_range.delta, 1e-9)
 
                     scoring = bool(scoring_map.get(oid, False))
-                    inventory = risk.get_inventory(condition_id, token_id)
+                    # 与 eligible_orders 一致：每 token 每轮只信一次仓位快照，避免两次 positions
+                    # 请求结果不一致时出现「过滤时无仓、Telegram 却显示有仓仍改价」。
+                    inventory = inv_by_token[token_id]
                     side = _side(o)
                     price = _price(o)
                     sz = _remaining_size(o)
@@ -550,6 +771,8 @@ def main() -> None:
                             "side": side,
                             "price": price,
                             "size": sz,
+                            "depth_source": depth_src,
+                            "tick_source": tick_src,
                         }
                     )
 
@@ -571,11 +794,32 @@ def main() -> None:
                     side = row["side"]
                     price = row["price"]
                     sz_snap = row["size"]
+                    depth_source_row = str(row.get("depth_source") or "rest")
+                    tick_source_row = str(row.get("tick_source") or "rest")
 
                     fill_mkey = f"{token_id}:{str(side).upper()}"
                     if fill_mkey not in fill_monitor_keys_done:
                         fill_monitor_keys_done.add(fill_mkey)
-                        trades_fm = trades_by_token.get(token_id) or []
+                        long_lb = max(
+                            float(config.fill_lookback_sec),
+                            float(config.monitor_short_trade_lookback_sec),
+                        )
+                        trade_activity_source = "rest_fallback"
+                        if ws_hub is not None and ws_hub.market_channel_healthy(
+                            token_id
+                        ):
+                            ta = ws_hub.activity_trades(
+                                token_id, now=now, lookback_sec=long_lb
+                            )
+                            if ta:
+                                trades_fm = ta
+                                trade_activity_source = "ws_market"
+                            else:
+                                trades_fm = list(
+                                    trades_by_token.get(token_id) or []
+                                )
+                        else:
+                            trades_fm = list(trades_by_token.get(token_id) or [])
                         snap_fm = build_fill_monitor_snapshot(
                             trades_fm,
                             order_side=str(side),
@@ -590,7 +834,7 @@ def main() -> None:
                         LOG.info(
                             "MONITOR fill token=%s side=%s fill_rate=%.4f short_trades=%d "
                             "long_trades=%d fill_risk_score=%.4f trade_dir_en=%s trade_dir_zh=%s "
-                            "adverse_share=%.4f alert=%s reasons=%s",
+                            "adverse_share=%.4f alert=%s reasons=%s trade_activity_source=%s",
                             token_id[:28],
                             str(side).upper(),
                             snap_fm.fill_rate,
@@ -602,6 +846,7 @@ def main() -> None:
                             snap_fm.adverse_share,
                             trig_fm,
                             ",".join(reasons_fm) if reasons_fm else "",
+                            trade_activity_source,
                         )
                         if telegram.enabled and config.alert_monitoring_enabled:
                             mt_fm, oc_fm = _resolve_order_display(
@@ -655,7 +900,8 @@ def main() -> None:
                         )
                         LOG.info(
                             "MONITOR depth oid=%s token=%s band=[%.4f,%.4f] total_depth=%.4f "
-                            "closer_to_mid=%.4f depth_ratio=%.4f alert=%s",
+                            "closer_to_mid=%.4f depth_ratio=%.4f alert=%s depth_source=%s "
+                            "tick_size_source=%s",
                             oid[:18],
                             token_id[:28],
                             dst.scan_lo,
@@ -664,6 +910,8 @@ def main() -> None:
                             clo_d,
                             ratio_d,
                             trig_d,
+                            depth_source_row,
+                            tick_source_row,
                         )
                         if telegram.enabled and config.alert_monitoring_enabled:
                             mt_d, oc_d = _resolve_order_display(
@@ -745,6 +993,18 @@ def main() -> None:
                             lines=lines,
                             event_key=f"warn:replace_post:{oid}:{attempt}",
                         )
+
+                    # 提交前再查一次：若 Data API 在轮内从「无仓」变为「有仓」，避免误改价。
+                    inv_before_apply = risk.get_inventory(condition_id, token_id)
+                    if abs(inv_before_apply) > 1e-8:
+                        LOG.info(
+                            "SKIP_POSITION_RECHECK token_id=%s condition_id=%s inventory=%.6f — "
+                            "提交前 positions 显示有仓位，跳过本单改价/撤单",
+                            token_id[:28],
+                            condition_id[:20],
+                            inv_before_apply,
+                        )
+                        continue
 
                     apply_result = order_manager.apply_decision(
                         client,

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from passive_liquidity.config_manager import PassiveConfig
+
+if TYPE_CHECKING:
+    from passive_liquidity.polymarket_ws_state import PolymarketWsHub
 from passive_liquidity.order_manager import _market, _oid, _price, _remaining_size, _side, _token_id
 
 LOG = logging.getLogger(__name__)
@@ -213,6 +216,7 @@ class FillNotificationTracker:
         now: float,
         get_inventory: Callable[[str, str], float],
         send_fill_telegram: Callable[..., None],
+        ws_hub: Optional["PolymarketWsHub"] = None,
     ) -> None:
         lookback = max(30.0, float(config.fill_infer_trade_lookback_sec))
         allow_manual = config.telegram_fill_manual_tokens
@@ -253,23 +257,33 @@ class FillNotificationTracker:
                 lookback_sec=lookback,
                 max_size=max(prev.remaining_size, 0.0) + 1e-6,
             )
+            ws_c = (
+                ws_hub.get_user_size_matched(oid)
+                if ws_hub is not None and ws_hub.user_connected_flag()
+                else None
+            )
             if inferred <= 1e-9:
-                LOG.debug(
-                    "Order vanished without trade rows referencing order id (cancel/replace?): %s",
-                    oid[:20],
-                )
-                continue
+                if ws_c is None or ws_c <= prev.cumulative_filled + 1e-9:
+                    LOG.debug(
+                        "Order vanished without trade rows or ws fill (cancel/replace?): %s",
+                        oid[:20],
+                    )
+                    continue
+                inf_px = None
 
             fill_amt = min(inferred, prev.remaining_size) if prev.remaining_size > 1e-9 else inferred
-            observed_cum = min(
-                prev.original_size,
-                prev.cumulative_filled + fill_amt,
-            )
+            rest_cum = min(prev.original_size, prev.cumulative_filled + fill_amt)
+            if ws_c is not None:
+                observed_cum = min(prev.original_size, max(rest_cum, ws_c))
+            else:
+                observed_cum = rest_cum
             delta_notify = observed_cum - prev_notified
             if delta_notify <= 1e-9:
                 continue
 
             is_full = prev.remaining_size <= fill_amt + 1e-9 or observed_cum >= prev.original_size - 1e-9
+            used_ws = ws_c is not None and observed_cum > rest_cum + 1e-9
+            fill_src = "ws_user" if used_ws else "rest"
             self._maybe_send(
                 config=config,
                 snap=prev,
@@ -281,19 +295,41 @@ class FillNotificationTracker:
                 get_inventory=get_inventory,
                 send_fill_telegram=send_fill_telegram,
                 dedupe_total_filled=observed_cum,
+                fill_detection_source=fill_src,
             )
 
         for oid, cur in current_snaps.items():
             prev = self._prev.get(oid)
 
             if prev is None:
+                ws_c0 = (
+                    ws_hub.get_user_size_matched(oid)
+                    if ws_hub is not None and ws_hub.user_connected_flag()
+                    else None
+                )
+                start_cum = min(
+                    cur.original_size,
+                    max(cur.cumulative_filled, ws_c0 if ws_c0 is not None else 0.0),
+                )
                 self._prev[oid] = cur
-                self._notified_cumulative[oid] = cur.cumulative_filled
+                self._notified_cumulative[oid] = start_cum
                 continue
 
             prev_notified = self._notified_cumulative.get(oid, 0.0)
             rem_drop = max(0.0, prev.remaining_size - cur.remaining_size)
-            cum_gain = max(0.0, cur.cumulative_filled - prev.cumulative_filled)
+            ws_c = (
+                ws_hub.get_user_size_matched(oid)
+                if ws_hub is not None and ws_hub.user_connected_flag()
+                else None
+            )
+            cur_eff_cum = min(
+                cur.original_size,
+                max(
+                    cur.cumulative_filled,
+                    ws_c if ws_c is not None else cur.cumulative_filled,
+                ),
+            )
+            cum_gain = max(0.0, cur_eff_cum - prev.cumulative_filled)
             inc = max(rem_drop, cum_gain)
             if inc <= 1e-9:
                 self._prev[oid] = cur
@@ -301,7 +337,7 @@ class FillNotificationTracker:
 
             observed_cum = min(
                 cur.original_size,
-                max(cur.cumulative_filled, prev.cumulative_filled + inc),
+                max(cur_eff_cum, prev.cumulative_filled + inc),
             )
             delta_notify = observed_cum - prev_notified
             if delta_notify <= 1e-9:
@@ -310,6 +346,8 @@ class FillNotificationTracker:
 
             is_full = cur.remaining_size <= 1e-9
             fill_px: Optional[float] = cur.price
+            used_ws = ws_c is not None and cur_eff_cum > cur.cumulative_filled + 1e-9
+            fill_src = "ws_user" if used_ws else "rest"
             self._maybe_send(
                 config=config,
                 snap=cur,
@@ -321,6 +359,7 @@ class FillNotificationTracker:
                 get_inventory=get_inventory,
                 send_fill_telegram=send_fill_telegram,
                 dedupe_total_filled=observed_cum,
+                fill_detection_source=fill_src,
             )
             self._notified_cumulative[oid] = observed_cum
             self._prev[oid] = cur
@@ -338,6 +377,7 @@ class FillNotificationTracker:
         get_inventory: Callable[[str, str], float],
         send_fill_telegram: Callable[..., None],
         dedupe_total_filled: float,
+        fill_detection_source: str = "rest",
     ) -> None:
         if not config.telegram_notify_fill:
             return
@@ -366,6 +406,7 @@ class FillNotificationTracker:
                 scoring=scoring,
                 inventory=inv,
                 dedupe_total_filled=dedupe_total_filled,
+                fill_detection_source=fill_detection_source,
             )
         except Exception as e:
             LOG.warning("fill telegram callback failed: %s", e)

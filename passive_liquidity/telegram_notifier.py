@@ -237,6 +237,7 @@ class TelegramNotifier:
         scoring_status_text_s: str,
         fill_price: Optional[float] = None,
         inventory: Optional[float] = None,
+        fill_detection_source: Optional[str] = None,
     ) -> str:
         label = (account_label or "").strip() or self._account_label
         lines = [
@@ -255,6 +256,8 @@ class TelegramNotifier:
         lines.append(f"计分状态: {scoring_status_text_s}")
         if inventory is not None:
             lines.append(f"当前持仓: {inventory:.4f}")
+        if fill_detection_source:
+            lines.append(f"成交检测来源: {fill_detection_source}")
         return "\n".join(lines)
 
     def format_order_event_message(self, ev: OrderEventFormat) -> str:
@@ -294,6 +297,20 @@ class TelegramNotifier:
         """Generic Chinese alert for API / order-operation warnings (balance, retry, etc.)."""
         body = "\n".join([f"[{self._account_label}]", f"⚠️ {title_zh}", ""] + lines)
         fp = stable_fingerprint("op_warn", event_key, body[:3000])
+        self.send_message(text=body, event_key=event_key, payload_hash=fp)
+
+    def notify_ws_transport_zh(
+        self,
+        *,
+        title_zh: str,
+        lines: list[str],
+        event_key: str,
+    ) -> None:
+        """WebSocket connect/disconnect / REST fallback (monitoring transport only)."""
+        body = "\n".join([f"[{self._account_label}]", title_zh, ""] + lines)
+        fp = stable_fingerprint(
+            "ws_transport", event_key, body[:2000], time.time()
+        )
         self.send_message(text=body, event_key=event_key, payload_hash=fp)
 
     def notify_whitelist_init(

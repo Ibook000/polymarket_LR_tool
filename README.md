@@ -6,7 +6,7 @@ Python **监控与调价**程序：您在 [Polymarket](https://docs.polymarket.c
 @臭臭Panda 推特/X ： https://x.com/Chosmos110
 ## 当前策略概要（主循环）
 
-1. **冻结白名单**（进程启动时确定，运行中不增 token）：环境变量 `PASSIVE_TOKEN_WHITELIST`，或启动当刻未成交单里的唯一 `token_id`。
+1. **白名单**：若设置 `PASSIVE_TOKEN_WHITELIST`，则仅以环境变量为准（运行中不随挂单变化）。若未设置，则从当前未成交单提取 `token_id`，并默认每 **120 秒**（`PASSIVE_WHITELIST_REFRESH_SEC`）用未成交单刷新，以便启动后新挂的单可被纳入；设为 `0` 则仅在启动时种子一次。
 2. **过滤**：仅管理白名单内订单；若该 `token_id` **已有持仓**（`abs(inventory) > 1e-8`），则**整 token 不处理**（不撤、不改、不进 fill 推断与周期摘要明细）。
 3. **调价**：仅 `passive_liquidity/simple_price_policy.py` 中的 **`decide_simple_price`**（粗 tick / 细 tick；见下文）。**不再**使用 `AdjustmentEngine`、结构性风控、fill risk、按积分微调、按库存调价等旧逻辑（相关文件仍留在仓库，主循环不调用）。
 4. **执行**：`OrderManager.apply_decision`（撤单、撤单后延迟、挂单失败可无限重试或限次，由配置决定）。
@@ -98,7 +98,8 @@ cp .env.example .env
 | 变量 | 含义 |
 | --- | --- |
 | **`PASSIVE_LOOP_INTERVAL`** | 主循环休眠间隔（秒） |
-| **`PASSIVE_TOKEN_WHITELIST`** | 逗号分隔 `token_id`；留空则启动时用当时未成交单种子白名单 |
+| **`PASSIVE_TOKEN_WHITELIST`** | 逗号分隔 `token_id`；留空则按未成交单维护白名单（见下行） |
+| **`PASSIVE_WHITELIST_REFRESH_SEC`** | 未设环境白名单时，每隔多少秒用未成交单重算白名单（默认 `120`）；`0` = 仅启动时种子 |
 | **`PASSIVE_ADJ_MIN_REPLACE_TICKS`** | 价差小于 N 个 tick 则视为不必 replace |
 | **`PASSIVE_MONITORING_POST_ONLY`** | 重挂是否 post-only |
 | **`PASSIVE_REPLACE_DELAY_AFTER_CANCEL_SEC`** | 撤单后等待再挂单 |
