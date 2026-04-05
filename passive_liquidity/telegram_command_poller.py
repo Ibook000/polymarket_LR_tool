@@ -16,13 +16,18 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from passive_liquidity.custom_pricing_rules_store import CustomPricingRulesStore
 from passive_liquidity.order_manager import OrderManager
+from passive_liquidity.orderbook_fetcher import OrderBookFetcher
+from passive_liquidity.simple_price_policy import CustomPricingSettings
 from passive_liquidity.telegram_live_queries import (
     get_live_account_status,
     get_live_order_summary,
     get_live_pnl,
 )
+from passive_liquidity.market_display import MarketDisplayResolver
 from passive_liquidity.telegram_notifier import TelegramNotifier
+from passive_liquidity.telegram_rule_setup import dispatch_command, handle_fsm_text
 
 LOG = logging.getLogger(__name__)
 
@@ -32,25 +37,6 @@ def _commands_enabled_from_env() -> bool:
     if v in ("0", "false", "no", "off"):
         return False
     return True
-
-
-def _parse_command(text: str) -> Optional[str]:
-    """
-    Normalize Telegram command text for dispatch.
-
-    In groups, Telegram sends e.g. ``/status@YourBotName`` — strip the ``@botname``
-    suffix so all handlers see ``/status`` (same for /orders, /pnl, /help, /start).
-    """
-    raw = str(text).strip()
-    if not raw.startswith("/"):
-        return None
-    # First whitespace-delimited token only (ignore command arguments)
-    token = raw.split(None, 1)[0]
-    # /status@PolyMarket_ccpanda_bot → /status
-    command = token.split("@", 1)[0]
-    if not command.startswith("/"):
-        return None
-    return command.lower()
 
 
 def _chat_id_matches(msg_chat_id: Any, configured: str) -> bool:
@@ -83,6 +69,10 @@ def _poll_loop(
     order_manager: OrderManager,
     funder: str,
     poll_timeout_sec: int,
+    rules_store: CustomPricingRulesStore,
+    book_fetcher: OrderBookFetcher,
+    default_custom_settings: CustomPricingSettings,
+    market_display: Optional[MarketDisplayResolver],
 ) -> None:
     token = notifier.bot_token
     expect_chat = notifier.chat_id
@@ -117,53 +107,135 @@ def _poll_loop(
             text = msg.get("text")
             if not isinstance(text, str):
                 continue
-            cmd = _parse_command(text)
-            if cmd is None:
-                continue
 
-            LOG.info("Telegram command received: %s", cmd)
+            chat_id = str(chat.get("id"))
+            stripped = text.strip()
 
-            try:
-                if cmd == "/status":
-                    ok, body = get_live_account_status(
-                        client=client,
-                        order_manager=order_manager,
-                        funder=funder,
-                        account_label=notifier.account_label,
-                    )
-                elif cmd == "/orders":
-                    ok, body = get_live_order_summary(
-                        client=client,
-                        order_manager=order_manager,
-                        account_label=notifier.account_label,
-                    )
-                elif cmd == "/pnl":
-                    ok, body = get_live_pnl(
-                        client=client,
-                        order_manager=order_manager,
-                        funder=funder,
-                        account_label=notifier.account_label,
-                    )
-                elif cmd in ("/start", "/help"):
-                    body = (
-                        f"[{notifier.account_label}]\n"
-                        "可用命令（实时查询，非半点摘要）：\n"
-                        "/status — 账户与挂单概览\n"
-                        "/orders — 未成交单统计\n"
-                        "/pnl — 盈亏\n"
-                    )
-                    ok = True
-                else:
+            def _label(msg_body: str) -> str:
+                return f"[{notifier.account_label}]\n{msg_body}"
+
+            rule_slash = (
+                "/set_rule",
+                "/get_rule",
+                "/clear_rule",
+                "/cancel_rule_setup",
+            )
+
+            if stripped.startswith("/"):
+                first_tok = stripped.split(None, 1)[0]
+                cmd_base = first_tok.split("@", 1)[0].lower()
+                arg_rest = (
+                    stripped.split(None, 1)[1].strip()
+                    if len(stripped.split(None, 1)) > 1
+                    else ""
+                )
+
+                if cmd_base in rule_slash:
+                    LOG.info("Telegram rule command: %s", cmd_base)
+                    try:
+                        reply = dispatch_command(
+                            chat_id,
+                            cmd_base,
+                            arg_rest,
+                            client=client,
+                            order_manager=order_manager,
+                            book_fetcher=book_fetcher,
+                            store=rules_store,
+                            default_settings=default_custom_settings,
+                        )
+                    except Exception as e:
+                        LOG.exception("Telegram rule command error")
+                        reply = f"⚠️ 命令处理异常: {e}"
+                    if reply:
+                        notifier.send_command_reply(_label(reply))
                     continue
 
-                if not ok:
-                    body = f"[{notifier.account_label}]\n⚠️ {body}"
-                notifier.send_command_reply(body)
-            except Exception as e:
-                LOG.exception("Telegram command handler error: %s", e)
-                notifier.send_command_reply(
-                    f"[{notifier.account_label}]\n⚠️ 命令处理异常: {e}"
-                )
+                # 群组隐私模式：纯数字/yes 等普通消息可能收不到；用 /input 走命令入口
+                if cmd_base in ("/input", "/answer"):
+                    if not arg_rest.strip():
+                        notifier.send_command_reply(
+                            _label(
+                                "用法: /input <本步答案>\n"
+                                "与直接发消息相同，例如：`/input 2`、`/input yes`、`/input 0.4`、`/input confirm`。\n"
+                                "在群里配置时若单独发数字 Bot 无回复，请用本条命令。"
+                            )
+                        )
+                        continue
+                    fsm_reply = handle_fsm_text(
+                        chat_id,
+                        arg_rest,
+                        store=rules_store,
+                        default_settings=default_custom_settings,
+                    )
+                    if fsm_reply is not None:
+                        notifier.send_command_reply(_label(fsm_reply))
+                    else:
+                        notifier.send_command_reply(
+                            _label(
+                                "当前没有进行中的规则配置，请先 /set_rule <order_id>。"
+                            )
+                        )
+                    continue
+
+                cmd = cmd_base
+                LOG.info("Telegram command received: %s", cmd)
+
+                try:
+                    if cmd == "/status":
+                        ok, body = get_live_account_status(
+                            client=client,
+                            order_manager=order_manager,
+                            funder=funder,
+                            account_label=notifier.account_label,
+                        )
+                    elif cmd == "/orders":
+                        ok, body = get_live_order_summary(
+                            client=client,
+                            order_manager=order_manager,
+                            market_display=market_display,
+                        )
+                    elif cmd == "/pnl":
+                        ok, body = get_live_pnl(
+                            client=client,
+                            order_manager=order_manager,
+                            funder=funder,
+                            account_label=notifier.account_label,
+                        )
+                    elif cmd in ("/start", "/help"):
+                        body = (
+                            "可用命令（实时查询，非半点摘要）：\n"
+                            "/status — 账户与挂单概览\n"
+                            "/orders — 未成交单（盘口名、order_id、side、price、size）\n"
+                            "/pnl — 盈亏\n"
+                            "\n自定义调价（规则按 token_id + 买卖方向 保存）：\n"
+                            "/set_rule <order_id> — 交互式配置\n"
+                            "/input <答案> — 群内提交某一步（等同发普通消息）\n"
+                            "/get_rule <order_id> — 查看已保存规则\n"
+                            "/clear_rule <order_id> — 删除规则恢复默认\n"
+                            "/cancel_rule_setup — 取消进行中的配置\n"
+                        )
+                        ok = True
+                    else:
+                        continue
+
+                    if not ok:
+                        body = f"⚠️ {body}"
+                    notifier.send_command_reply(_label(body))
+                except Exception as e:
+                    LOG.exception("Telegram command handler error: %s", e)
+                    notifier.send_command_reply(
+                        _label(f"⚠️ 命令处理异常: {e}")
+                    )
+                continue
+
+            fsm_reply = handle_fsm_text(
+                chat_id,
+                text,
+                store=rules_store,
+                default_settings=default_custom_settings,
+            )
+            if fsm_reply is not None:
+                notifier.send_command_reply(_label(fsm_reply))
 
         if max_uid > 0:
             offset = max_uid + 1
@@ -176,6 +248,10 @@ def start_telegram_command_poller(
     order_manager: OrderManager,
     funder: str,
     stop: threading.Event,
+    rules_store: CustomPricingRulesStore,
+    book_fetcher: OrderBookFetcher,
+    default_custom_settings: CustomPricingSettings,
+    market_display: Optional[MarketDisplayResolver] = None,
 ) -> Optional[threading.Thread]:
     if not notifier.enabled:
         LOG.info("Telegram command poller skipped (notifications disabled)")
@@ -206,6 +282,10 @@ def start_telegram_command_poller(
             order_manager=order_manager,
             funder=funder,
             poll_timeout_sec=poll_timeout,
+            rules_store=rules_store,
+            book_fetcher=book_fetcher,
+            default_custom_settings=default_custom_settings,
+            market_display=market_display,
         )
         LOG.info("Telegram command poller stopped")
 

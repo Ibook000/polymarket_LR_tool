@@ -81,6 +81,38 @@ _PRICING_REASON_ZH: dict[str, str] = {
     "fine_tick_move_inward_to_half_band_noop_small_delta": (
         "细tick：应内收半带，但与现价相差不足最小 tick，保持"
     ),
+    # custom pricing mode (PASSIVE_CUSTOM_ORDER_IDS)
+    "custom_missing_settings_keep": "自定义调价：缺少参数，保持",
+    "custom_coarse_keep_band_outside_market": (
+        "自定义粗tick：激励带与有效价格区间无交集，保持"
+    ),
+    "custom_coarse_keep_insufficient_candidates": (
+        "自定义粗tick：激励带内 tick 档位数少于 min_candidate_levels，保持"
+    ),
+    "custom_coarse_replace_exact_offset_from_mid": (
+        "自定义粗tick：改价至配置 N 对应档（距对齐 mid 为 N−1 个 tick，N=1 即 mid）"
+    ),
+    "custom_coarse_keep_offset_outside_band": (
+        "自定义粗tick：目标档被夹到带外或与配置步数不一致，保持"
+    ),
+    "custom_coarse_keep_target_is_top_of_book": (
+        "自定义粗tick：目标价即最优买/卖档且未允许 top-of-book，保持"
+    ),
+    "custom_coarse_keep_offset_invalid_price": (
+        "自定义粗tick：目标价无效（越出 0–1），保持"
+    ),
+    "custom_coarse_keep_already_at_target": (
+        "自定义粗tick：已在目标价附近（最小变动不足），保持"
+    ),
+    "custom_fine_keep_in_safe_band": (
+        "自定义细tick：|价−mid|/δ 已在安全比例带内，保持"
+    ),
+    "custom_fine_move_toward_target_ratio": (
+        "自定义细tick：向目标 band 比例价位调整"
+    ),
+    "custom_fine_keep_small_delta": (
+        "自定义细tick：目标价与现价相差不足最小 tick，保持"
+    ),
 }
 
 

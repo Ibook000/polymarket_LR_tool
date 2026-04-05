@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from passive_liquidity.account_portfolio import (
@@ -27,6 +28,7 @@ from passive_liquidity.condition_monitoring import (
     fill_metrics_dict,
 )
 from passive_liquidity.config_manager import PassiveConfig
+from passive_liquidity.custom_pricing_rules_store import CustomPricingRulesStore
 from passive_liquidity.fill_detection import FillNotificationTracker
 from passive_liquidity.logger_setup import setup_logging
 from passive_liquidity.market_display import MarketDisplayResolver
@@ -47,9 +49,11 @@ from passive_liquidity.polymarket_ws_user import PolymarketUserWsThread
 from passive_liquidity.reward_monitor import RewardMonitor
 from passive_liquidity.risk_manager import RiskManager
 from passive_liquidity.simple_price_policy import (
+    CustomPricingSettings,
     compute_eligible_band_depth_stats,
     decide_simple_price,
     format_eligible_band_depth_summary_zh,
+    order_uses_custom_pricing,
 )
 from passive_liquidity.telegram_command_poller import start_telegram_command_poller
 from passive_liquidity.telegram_notifier import (
@@ -180,6 +184,12 @@ def main() -> None:
     telegram = build_telegram_notifier_from_env()
     if telegram.enabled:
         LOG.info("Telegram notifications enabled (account=%s)", telegram.account_label)
+        if not config.alert_monitoring_enabled and config.telegram_notify_fill:
+            LOG.warning(
+                "PASSIVE_ALERT_MONITORING=false only disables passive tape/depth risk alerts; "
+                "order fill Telegram is still ON (PASSIVE_TELEGRAM_NOTIFY_FILL). "
+                "Set PASSIVE_TELEGRAM_NOTIFY_FILL=false to stop 订单成交 messages."
+            )
     else:
         LOG.info("Telegram notifications disabled or misconfigured")
 
@@ -204,6 +214,8 @@ def main() -> None:
     risk = RiskManager(config, funder)
     order_manager = OrderManager()
     market_display = MarketDisplayResolver(config.gamma_api_host)
+    rules_store = CustomPricingRulesStore(Path(config.custom_rules_store_path))
+    LOG.info("Custom pricing rules store: %s", rules_store.path)
 
     frozen_whitelist, wl_source, seed_order_n = _resolve_initial_frozen_whitelist(
         client, order_manager, config.token_whitelist
@@ -403,6 +415,25 @@ def main() -> None:
         order_manager=order_manager,
         funder=funder,
         stop=telegram_command_stop,
+        rules_store=rules_store,
+        book_fetcher=book_fetcher,
+        default_custom_settings=CustomPricingSettings(
+            coarse_tick_offset_from_mid=int(
+                config.custom_coarse_tick_offset_from_mid
+            ),
+            coarse_allow_top_of_book=bool(
+                config.custom_coarse_allow_top_of_book
+            ),
+            coarse_min_candidate_levels=int(
+                config.custom_coarse_min_candidate_levels
+            ),
+            fine_safe_band_min=float(config.custom_fine_safe_band_min),
+            fine_safe_band_max=float(config.custom_fine_safe_band_max),
+            fine_target_band_ratio=float(
+                config.custom_fine_target_band_ratio
+            ),
+        ),
+        market_display=market_display,
     )
 
     class _WsSubRef:
@@ -816,6 +847,23 @@ def main() -> None:
                 band_summary_rows = cycle_rows
                 band_summary_eligible_n = len(eligible_orders)
 
+                custom_pricing_settings = CustomPricingSettings(
+                    coarse_tick_offset_from_mid=int(
+                        config.custom_coarse_tick_offset_from_mid
+                    ),
+                    coarse_allow_top_of_book=bool(
+                        config.custom_coarse_allow_top_of_book
+                    ),
+                    coarse_min_candidate_levels=int(
+                        config.custom_coarse_min_candidate_levels
+                    ),
+                    fine_safe_band_min=float(config.custom_fine_safe_band_min),
+                    fine_safe_band_max=float(config.custom_fine_safe_band_max),
+                    fine_target_band_ratio=float(
+                        config.custom_fine_target_band_ratio
+                    ),
+                )
+
                 fill_monitor_keys_done: set[str] = set()
                 for row in cycle_rows:
                     o = row["o"]
@@ -987,6 +1035,23 @@ def main() -> None:
                     except Exception as e:
                         LOG.debug("MONITOR depth stats skipped: %s", e)
 
+                    stored_rule = rules_store.get_rule(
+                        token_id, str(side).strip().upper()
+                    )
+                    env_custom = order_uses_custom_pricing(
+                        o, config.custom_pricing_order_ids
+                    )
+                    use_custom = stored_rule is not None or env_custom
+                    if stored_rule is not None:
+                        settings_for_order = stored_rule.to_settings()
+                        regime_override = stored_rule.tick_regime
+                    elif env_custom:
+                        settings_for_order = custom_pricing_settings
+                        regime_override = None
+                    else:
+                        settings_for_order = None
+                        regime_override = None
+
                     decision, meta = decide_simple_price(
                         side=side,
                         price=price,
@@ -996,6 +1061,13 @@ def main() -> None:
                         bids=book.bids,
                         asks=book.asks,
                         min_replace_ticks=config.adjustment_min_replace_ticks,
+                        pricing_mode="custom" if use_custom else "default",
+                        custom_settings=settings_for_order
+                        if use_custom
+                        else None,
+                        best_bid=book.best_bid,
+                        best_ask=book.best_ask,
+                        custom_tick_regime_override=regime_override,
                     )
 
                     def _on_replace_post_retry(attempt: int, err: str) -> None:
@@ -1060,13 +1132,14 @@ def main() -> None:
                     dist_norm = dist / max(delta, 1e-12)
                     LOG.info(
                         "simple_order=%s %s @ %.4f | mid=%.4f dist_norm=%.3f×band | "
-                        "tick_size=%s regime=%s candidates=%s candidate_count=%s "
+                        "mode=%s tick_size=%s regime=%s candidates=%s candidate_count=%s "
                         "chosen_target=%s | apply=%s reason_code=%s",
                         oid[:18],
                         side,
                         price,
                         mid,
                         dist_norm,
+                        meta.get("pricing_mode"),
                         meta.get("tick_size"),
                         meta.get("tick_regime"),
                         meta.get("candidate_prices"),

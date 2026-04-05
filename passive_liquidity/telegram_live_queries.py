@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import Counter
 from typing import Any, Optional, Tuple
 
 from passive_liquidity.account_portfolio import (
@@ -18,7 +17,15 @@ from passive_liquidity.account_portfolio import (
     resolve_deposit_reference,
 )
 from passive_liquidity.bridge_deposits import fetch_bridge_polygon_usdc_deposits
-from passive_liquidity.order_manager import OrderManager, _market, _side, _token_id
+from passive_liquidity.market_display import MarketDisplayResolver
+from passive_liquidity.order_manager import (
+    OrderManager,
+    _oid,
+    _price,
+    _remaining_size,
+    _side,
+    _token_id,
+)
 from passive_liquidity.polygon_deposits import fetch_polygon_usdc_deposit_summary
 
 LOG = logging.getLogger(__name__)
@@ -32,6 +39,59 @@ def _data_api_host() -> str:
     return os.environ.get(
         "POLYMARKET_DATA_API", "https://data-api.polymarket.com"
     ).rstrip("/")
+
+
+def _order_display_meta(order: dict) -> tuple[str, str]:
+    title = str(
+        order.get("question")
+        or order.get("market_question")
+        or order.get("title")
+        or ""
+    ).strip()
+    if not title:
+        slug = order.get("market_slug") or order.get("slug") or ""
+        title = str(slug).strip() if slug else ""
+    if not title:
+        mid = str(order.get("market") or order.get("condition_id") or "").strip()
+        title = (mid[:48] + "…") if len(mid) > 48 else mid if mid else ""
+    outcome = str(order.get("outcome") or order.get("outcome_name") or "").strip()
+    return title, outcome
+
+
+def _order_has_human_market_copy(order: dict) -> bool:
+    if str(
+        order.get("question")
+        or order.get("market_question")
+        or order.get("title")
+        or ""
+    ).strip():
+        return True
+    if str(order.get("market_slug") or order.get("slug") or "").strip():
+        return True
+    return False
+
+
+def _orders_line_market_title(
+    order: dict,
+    condition_id: str,
+    token_id: str,
+    resolver: Optional[MarketDisplayResolver],
+) -> str:
+    title, outcome = _order_display_meta(order)
+    if resolver is not None and condition_id and token_id:
+        if not _order_has_human_market_copy(order):
+            gq, go = resolver.lookup(condition_id, token_id)
+            if gq:
+                title = gq
+            if go:
+                outcome = go
+    if title and outcome:
+        return f"{title}（{outcome}）"
+    if title:
+        return title
+    if outcome:
+        return outcome
+    return "（未知盘口）"
 
 
 def get_live_account_status(
@@ -119,7 +179,7 @@ def get_live_order_summary(
     *,
     client: Any,
     order_manager: OrderManager,
-    account_label: str,
+    market_display: Optional[MarketDisplayResolver] = None,
 ) -> Tuple[bool, str]:
     try:
         orders = order_manager.fetch_all_open_orders(client)
@@ -127,10 +187,9 @@ def get_live_order_summary(
         LOG.exception("live /orders: fetch failed: %s", e)
         return False, f"查询失败: {e}"
 
-    label = (account_label or "Polymarket").strip() or "Polymarket"
     n = len(orders)
+    # 账号前缀由 Telegram send_command_reply 统一加，此处不再重复 [label]
     lines = [
-        f"[{label}]",
         "实时挂单",
         f"未成交单总数: {n}",
     ]
@@ -138,39 +197,28 @@ def get_live_order_summary(
         lines.append("（当前无挂单）")
         return True, "\n".join(lines)
 
-    by_token: Counter[str] = Counter()
-    by_market: Counter[str] = Counter()
-    by_side: Counter[str] = Counter()
+    shown = 0
     for o in orders:
         if not isinstance(o, dict):
             continue
-        tid = _token_id(o)
-        if tid:
-            by_token[tid] += 1
-        m = _market(o)
-        if m:
-            by_market[m] += 1
-        by_side[_side(o) or "?"] += 1
-
-    lines.append(
-        "方向统计: "
-        + ", ".join(f"{k}={v}" for k, v in sorted(by_side.items()))
-    )
-    lines.append(f"不同 outcome 数（token_id）: {len(by_token)}")
-    lines.append(f"不同 condition 数: {len(by_market)}")
-    lines.append("")
-    lines.append("按 condition（前 10 个，次数，id 截断显示）:")
-    for mk, c in by_market.most_common(10):
-        disp = (mk[:18] + "…") if len(mk) > 20 else mk
-        lines.append(f" · {c}×  {disp}")
-    if len(by_market) > 10:
-        lines.append(f" … 共 {len(by_market)} 个市场，已截断")
-    lines.append("")
-    lines.append("按 token（前 15 个，次数）:")
-    for tid, c in by_token.most_common(15):
-        lines.append(f" · {c}×  {tid[:20]}…" if len(tid) > 20 else f" · {c}×  {tid}")
-    if len(by_token) > 15:
-        lines.append(f" … 共 {len(by_token)} 个 token，已截断")
+        oid = str(_oid(o) or "").strip()
+        if not oid:
+            continue
+        shown += 1
+        cid = str(o.get("market") or o.get("condition_id") or "").strip()
+        tid = str(_token_id(o) or "").strip()
+        market_title = _orders_line_market_title(o, cid, tid, market_display)
+        su = _side(o) or "?"
+        try:
+            px = float(_price(o))
+        except (TypeError, ValueError):
+            px = 0.0
+        sz = _remaining_size(o)
+        lines.append(f"{shown}) 盘口: {market_title}")
+        lines.append(f"   order_id={oid}")
+        lines.append(f"   side={su}  price={px}  size={sz}")
+    if shown == 0:
+        lines.append("（未能解析订单 id）")
     return True, "\n".join(lines)
 
 

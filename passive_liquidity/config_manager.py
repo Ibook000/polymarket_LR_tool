@@ -17,6 +17,14 @@ def _parse_token_whitelist(raw: Optional[str]) -> frozenset[str]:
     return frozenset(p for p in parts if p)
 
 
+def _parse_custom_order_ids(raw: Optional[str]) -> frozenset[str]:
+    """Comma-separated CLOB order ids using pricing_mode=custom when matched."""
+    if raw is None or not str(raw).strip():
+        return frozenset()
+    parts = [p.strip() for p in str(raw).split(",")]
+    return frozenset(p for p in parts if p)
+
+
 @dataclass
 class PassiveConfig:
     """Tunable parameters for passive reward quoting."""
@@ -148,7 +156,8 @@ class PassiveConfig:
     # Telegram: periodic summary of each managed order's |price−mid| / δ (reward half-spread).
     telegram_band_summary_enabled: bool = True
     telegram_band_summary_interval_sec: float = 600.0
-    # Passive market-condition alerts (Telegram + logs only; never affects orders).
+    # Passive market-condition alerts: tape fill-risk / depth ratio (Telegram + logs only).
+    # Does not control per-order fill notifications; see telegram_notify_fill.
     alert_monitoring_enabled: bool = True
     alert_cooldown_sec: float = 120.0
     monitor_short_trade_lookback_sec: float = 180.0
@@ -169,6 +178,16 @@ class PassiveConfig:
     ws_stale_sec: float = 25.0
     ws_reconcile_every_loops: int = 15
     ws_telegram_transport_alerts: bool = True
+    # Custom pricing (simple_price_policy): only orders listed in custom_pricing_order_ids.
+    custom_pricing_order_ids: frozenset[str] = field(default_factory=frozenset)
+    custom_coarse_tick_offset_from_mid: int = 1
+    custom_coarse_allow_top_of_book: bool = True
+    custom_coarse_min_candidate_levels: int = 1
+    custom_fine_safe_band_min: float = 0.4
+    custom_fine_safe_band_max: float = 0.6
+    custom_fine_target_band_ratio: float = 0.5
+    # JSON path for Telegram /set_rule persisted rules (token_id+side keys).
+    custom_rules_store_path: str = ""
 
     @classmethod
     def from_env(cls) -> PassiveConfig:
@@ -466,5 +485,36 @@ class PassiveConfig:
             ws_telegram_transport_alerts=b(
                 "PASSIVE_WS_TELEGRAM_TRANSPORT",
                 cls.ws_telegram_transport_alerts,
+            ),
+            custom_pricing_order_ids=_parse_custom_order_ids(
+                os.environ.get("PASSIVE_CUSTOM_ORDER_IDS")
+            ),
+            custom_coarse_tick_offset_from_mid=i(
+                "PASSIVE_CUSTOM_COARSE_TICK_OFFSET",
+                cls.custom_coarse_tick_offset_from_mid,
+            ),
+            custom_coarse_allow_top_of_book=b(
+                "PASSIVE_CUSTOM_COARSE_ALLOW_TOP_OF_BOOK",
+                cls.custom_coarse_allow_top_of_book,
+            ),
+            custom_coarse_min_candidate_levels=i(
+                "PASSIVE_CUSTOM_COARSE_MIN_CANDIDATES",
+                cls.custom_coarse_min_candidate_levels,
+            ),
+            custom_fine_safe_band_min=f(
+                "PASSIVE_CUSTOM_FINE_SAFE_MIN",
+                cls.custom_fine_safe_band_min,
+            ),
+            custom_fine_safe_band_max=f(
+                "PASSIVE_CUSTOM_FINE_SAFE_MAX",
+                cls.custom_fine_safe_band_max,
+            ),
+            custom_fine_target_band_ratio=f(
+                "PASSIVE_CUSTOM_FINE_TARGET_RATIO",
+                cls.custom_fine_target_band_ratio,
+            ),
+            custom_rules_store_path=(
+                os.environ.get("PASSIVE_CUSTOM_RULES_PATH", "").strip()
+                or str(_PROJECT_DIR / "custom_pricing_rules.json")
             ),
         )

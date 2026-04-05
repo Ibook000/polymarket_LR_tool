@@ -18,6 +18,32 @@ from passive_liquidity.orderbook_fetcher import _level_price
 LOG = logging.getLogger(__name__)
 
 TickRegime = Literal["coarse", "fine", "unsupported"]
+CustomTickRegime = Literal["coarse", "fine"]
+PricingMode = Literal["default", "custom"]
+
+
+@dataclass(frozen=True)
+class CustomPricingSettings:
+    """Env-driven knobs for pricing_mode=custom (see PASSIVE_CUSTOM_*).
+
+    ``coarse_tick_offset_from_mid`` (N): coarse targets aligned mid when N=1,
+    else (N-1) ticks from aligned mid toward the reward band (BUY lower, SELL higher).
+    """
+
+    coarse_tick_offset_from_mid: int
+    coarse_allow_top_of_book: bool
+    coarse_min_candidate_levels: int
+    fine_safe_band_min: float
+    fine_safe_band_max: float
+    fine_target_band_ratio: float
+
+
+def order_uses_custom_pricing(order: dict, custom_order_ids: frozenset[str]) -> bool:
+    """True when order id is listed in PASSIVE_CUSTOM_ORDER_IDS."""
+    if not custom_order_ids:
+        return False
+    oid = str(order.get("id") or order.get("orderID") or "").strip()
+    return bool(oid) and oid in custom_order_ids
 
 
 def classify_tick_regime(tick: float) -> TickRegime:
@@ -32,6 +58,24 @@ def classify_tick_regime(tick: float) -> TickRegime:
     ):
         return "fine"
     return "unsupported"
+
+
+def classify_custom_tick_regime(tick: float) -> CustomTickRegime:
+    """
+    Custom / Telegram rules: same coarse vs fine split as default ``decide_simple_price``.
+
+    Coarse (book-style grid): tick ≈ 0.01 or ≈ 1.0. Fine (band ratio): ≈ 0.1 or ≈ 0.001.
+    Unknown tick sizes fall back with a simple size heuristic so setup always picks a branch.
+    """
+    r = classify_tick_regime(tick)
+    if r == "coarse":
+        return "coarse"
+    if r == "fine":
+        return "fine"
+    t = float(tick)
+    if t < 0.05:
+        return "fine"
+    return "coarse"
 
 
 def _round_tick(price: float, tick: float) -> float:
@@ -273,6 +317,305 @@ def _min_replace_delta(tick: float, min_replace_ticks: int) -> float:
     return max(1, int(min_replace_ticks)) * float(tick)
 
 
+def _tick_prices_in_closed_interval(lo: float, hi: float, tick: float) -> list[float]:
+    """All tick-aligned prices in [lo, hi] (inclusive), ascending.
+
+    Uses raw multiples of ``tick`` (not ``_round_tick``), because ``_round_tick`` clamps
+    to ``[tick, 1 - tick]`` for CLOB probability prices and would break grids when
+    ``tick >= 1`` or when scanning wide numeric ranges.
+    """
+    t = max(float(tick), 1e-12)
+    lo_f, hi_f = float(lo), float(hi)
+    if hi_f < lo_f - 1e-15:
+        return []
+    k0 = int(math.ceil(lo_f / t - 1e-9))
+    k1 = int(math.floor(hi_f / t + 1e-9))
+    out: list[float] = []
+    for k in range(k0, k1 + 1):
+        p = float(k) * t
+        if p < lo_f - 1e-12 or p > hi_f + 1e-12:
+            continue
+        if not out or abs(p - out[-1]) > 1e-12:
+            out.append(p)
+    return out
+
+
+def _valid_clob_probability_price(p: float) -> bool:
+    """Polymarket outcome prices must lie strictly inside (0, 1)."""
+    x = float(p)
+    return 1e-12 < x < 1.0 - 1e-12
+
+
+def _ticks_from_mid_into_band(side_u: str, mid: float, price: float, tick: float) -> int:
+    """Whole ticks from mid toward the reward band (BUY: below mid, SELL: above mid).
+
+    Uses tick-index subtraction after snapping to the grid so float noise in
+    ``(mid - price) / tick`` cannot undercount (e.g. spurious
+    ``custom_coarse_keep_offset_outside_band`` when target is one tick off mid).
+    """
+    t = max(float(tick), 1e-12)
+    mid_t = _round_tick(float(mid), t)
+    pr_t = _round_tick(float(price), t)
+    im = int(round(mid_t / t))
+    ip = int(round(pr_t / t))
+    if side_u == "BUY":
+        return max(0, im - ip)
+    return max(0, ip - im)
+
+
+def _distance_ratio_in_band(side_u: str, price: float, mid: float, delta: float) -> float:
+    band = max(float(delta), 1e-12)
+    if side_u == "BUY":
+        return max(0.0, float(mid) - float(price)) / band
+    return max(0.0, float(price) - float(mid)) / band
+
+
+def _decide_custom_coarse(
+    *,
+    side_u: str,
+    price: float,
+    mid: float,
+    tick: float,
+    delta: float,
+    bids: list[Any],
+    asks: list[Any],
+    min_replace_ticks: int,
+    settings: CustomPricingSettings,
+    best_bid: Optional[float],
+    best_ask: Optional[float],
+    meta: dict[str, Any],
+) -> tuple[AdjustmentDecision, dict[str, Any]]:
+    lo, hi, band_used, band_ticks = _coarse_reward_scan_range(
+        side_u, mid, delta, tick
+    )
+    meta["coarse_reward_band_delta"] = band_used
+    meta["coarse_band_ticks"] = band_ticks
+
+    lo_c = max(float(lo), 1e-12)
+    hi_c = min(float(hi), 1.0 - 1e-12)
+    meta["coarse_range_lo_hi"] = (lo_c, hi_c)
+
+    if lo_c > hi_c + 1e-15:
+        meta["candidate_prices"] = []
+        meta["candidate_count"] = 0
+        meta["chosen_target_price"] = None
+        meta["reason_code"] = "custom_coarse_keep_band_outside_market"
+        LOG.info(
+            "custom_price coarse reward band does not intersect (0,1) after clip -> keep"
+        )
+        return (
+            AdjustmentDecision("keep", reason="custom_coarse_keep_band_outside_market"),
+            meta,
+        )
+
+    grid = _tick_prices_in_closed_interval(lo_c, hi_c, tick)
+    min_need = int(settings.coarse_min_candidate_levels)
+    if min_need < 1:
+        min_need = 1
+    if len(grid) < min_need:
+        meta["candidate_prices"] = list(grid)
+        meta["candidate_count"] = len(grid)
+        meta["custom_coarse_tick_offset"] = int(settings.coarse_tick_offset_from_mid)
+        rcode = "custom_coarse_keep_insufficient_candidates"
+        meta["reason_code"] = rcode
+        meta["chosen_target_price"] = None
+        LOG.info(
+            "custom_price coarse tick=%s grid_levels=%d need>=%d -> keep",
+            tick,
+            len(grid),
+            min_need,
+        )
+        return AdjustmentDecision("keep", reason=rcode), meta
+
+    user_n = max(1, int(settings.coarse_tick_offset_from_mid))
+    # N=1 → 对齐 mid；N=k → 距对齐 mid 为 (k−1) 个 tick（BUY 向低价，SELL 对称向高价）。
+    # 例 mid_s=0.16、tick=0.01：N=1→0.16，N=2→0.15，N=3→0.14，N=4→0.13。
+    offset = max(0, user_n - 1)
+    t = max(float(tick), 1e-12)
+    mid_s = _round_tick(float(mid), t)
+    if side_u == "BUY":
+        raw_target = mid_s - offset * t
+    else:
+        raw_target = mid_s + offset * t
+
+    chosen = _round_tick(raw_target, t)
+    chosen = max(lo_c, min(hi_c, chosen))
+    chosen = _round_tick(chosen, t)
+    chosen = max(lo_c, min(hi_c, chosen))
+
+    if not _valid_clob_probability_price(chosen):
+        meta["candidate_prices"] = []
+        meta["candidate_count"] = 0
+        meta["custom_coarse_tick_offset"] = user_n
+        meta["custom_coarse_tick_offset_effective"] = offset
+        meta["chosen_target_price"] = None
+        meta["reason_code"] = "custom_coarse_keep_offset_invalid_price"
+        return (
+            AdjustmentDecision("keep", reason="custom_coarse_keep_offset_invalid_price"),
+            meta,
+        )
+
+    ticks_at_target = _ticks_from_mid_into_band(side_u, mid_s, chosen, tick)
+    if ticks_at_target != offset:
+        meta["candidate_prices"] = [chosen]
+        meta["candidate_count"] = 1
+        meta["custom_coarse_tick_offset"] = user_n
+        meta["custom_coarse_tick_offset_effective"] = offset
+        meta["chosen_target_price"] = chosen
+        meta["reason_code"] = "custom_coarse_keep_offset_outside_band"
+        LOG.info(
+            "custom_price coarse user_n=%d eff=%d ticks_at_target=%d chosen=%.6f -> keep (clamped)",
+            user_n,
+            offset,
+            ticks_at_target,
+            chosen,
+        )
+        return (
+            AdjustmentDecision("keep", reason="custom_coarse_keep_offset_outside_band"),
+            meta,
+        )
+
+    if not settings.coarse_allow_top_of_book:
+        if side_u == "BUY" and best_bid is not None:
+            if abs(chosen - float(best_bid)) <= 1e-9:
+                meta["candidate_prices"] = [chosen]
+                meta["candidate_count"] = 1
+                meta["custom_coarse_tick_offset"] = user_n
+                meta["custom_coarse_tick_offset_effective"] = offset
+                meta["chosen_target_price"] = chosen
+                meta["reason_code"] = "custom_coarse_keep_target_is_top_of_book"
+                return (
+                    AdjustmentDecision(
+                        "keep", reason="custom_coarse_keep_target_is_top_of_book"
+                    ),
+                    meta,
+                )
+        if side_u == "SELL" and best_ask is not None:
+            if abs(chosen - float(best_ask)) <= 1e-9:
+                meta["candidate_prices"] = [chosen]
+                meta["candidate_count"] = 1
+                meta["custom_coarse_tick_offset"] = user_n
+                meta["custom_coarse_tick_offset_effective"] = offset
+                meta["chosen_target_price"] = chosen
+                meta["reason_code"] = "custom_coarse_keep_target_is_top_of_book"
+                return (
+                    AdjustmentDecision(
+                        "keep", reason="custom_coarse_keep_target_is_top_of_book"
+                    ),
+                    meta,
+                )
+
+    meta["candidate_prices"] = [chosen]
+    meta["candidate_count"] = 1
+    meta["custom_coarse_tick_offset"] = user_n
+    meta["custom_coarse_tick_offset_effective"] = offset
+    meta["chosen_target_price"] = chosen
+    meta["reason_code"] = "custom_coarse_replace_exact_offset_from_mid"
+
+    cur = _round_tick(float(price), tick)
+    min_d = _min_replace_delta(tick, min_replace_ticks)
+    if abs(chosen - cur) < min_d - 1e-12:
+        meta["reason_code"] = "custom_coarse_keep_already_at_target"
+        return (
+            AdjustmentDecision("keep", reason="custom_coarse_keep_already_at_target"),
+            meta,
+        )
+    return (
+        AdjustmentDecision(
+            "replace",
+            new_price=chosen,
+            reason="custom_coarse_replace_exact_offset_from_mid",
+        ),
+        meta,
+    )
+
+
+def _decide_custom_fine(
+    *,
+    side_u: str,
+    price: float,
+    mid: float,
+    tick: float,
+    delta: float,
+    min_replace_ticks: int,
+    settings: CustomPricingSettings,
+    meta: dict[str, Any],
+) -> tuple[AdjustmentDecision, dict[str, Any]]:
+    band = max(float(delta), 1e-12)
+    dr = _distance_ratio_in_band(side_u, price, mid, delta)
+    meta["distance_ratio"] = dr
+    meta["candidate_prices"] = []
+    meta["candidate_count"] = 0
+
+    lo = mid - band if side_u == "BUY" else mid
+    hi = mid if side_u == "BUY" else mid + band
+    if lo > hi:
+        lo, hi = hi, lo
+
+    smin = float(settings.fine_safe_band_min)
+    smax = float(settings.fine_safe_band_max)
+    if smin > smax:
+        smin, smax = smax, smin
+
+    tr = float(settings.fine_target_band_ratio)
+    tr = max(0.0, min(1.0, tr))
+
+    if smin - 1e-12 <= dr <= smax + 1e-12:
+        meta["reason_code"] = "custom_fine_keep_in_safe_band"
+        ideal = (
+            mid - tr * band if side_u == "BUY" else mid + tr * band
+        )
+        meta["chosen_target_price"] = _round_tick(ideal, tick)
+        LOG.info(
+            "custom_price fine tick=%s dr=%.4f in [%.3f,%.3f] -> keep",
+            tick,
+            dr,
+            smin,
+            smax,
+        )
+        return (
+            AdjustmentDecision("keep", reason="custom_fine_keep_in_safe_band"),
+            meta,
+        )
+
+    ideal = mid - tr * band if side_u == "BUY" else mid + tr * band
+    ideal = _round_tick(ideal, tick)
+    ideal = max(lo, min(hi, ideal))
+    ideal = _round_tick(ideal, tick)
+    meta["chosen_target_price"] = ideal
+    meta["reason_code"] = "custom_fine_move_toward_target_ratio"
+
+    t = float(tick)
+    min_d = _min_replace_delta(t, min_replace_ticks)
+    cur = _round_tick(float(price), t)
+    if abs(ideal - cur) < min_d - 1e-12:
+        meta["reason_code"] = "custom_fine_keep_small_delta"
+        LOG.info(
+            "custom_price fine tick=%s dr=%.4f target=%.4f cur=%.4f -> keep small delta",
+            tick,
+            dr,
+            ideal,
+            cur,
+        )
+        return AdjustmentDecision("keep", reason="custom_fine_keep_small_delta"), meta
+
+    LOG.info(
+        "custom_price fine tick=%s dr=%.4f -> replace to %.4f (target_ratio=%.4f)",
+        tick,
+        dr,
+        ideal,
+        tr,
+    )
+    return (
+        AdjustmentDecision(
+            "replace",
+            new_price=ideal,
+            reason="custom_fine_move_toward_target_ratio",
+        ),
+        meta,
+    )
+
+
 def decide_simple_price(
     *,
     side: str,
@@ -283,18 +626,72 @@ def decide_simple_price(
     bids: list[Any],
     asks: list[Any],
     min_replace_ticks: int = 1,
+    pricing_mode: PricingMode = "default",
+    custom_settings: Optional[CustomPricingSettings] = None,
+    best_bid: Optional[float] = None,
+    best_ask: Optional[float] = None,
+    custom_tick_regime_override: Optional[CustomTickRegime] = None,
 ) -> tuple[AdjustmentDecision, dict[str, Any]]:
     """
     Single pricing rule: coarse (tick ~0.01) or fine (~0.001); unsupported -> keep.
+
+    When pricing_mode is ``custom``, coarse/fine follows ``classify_custom_tick_regime``
+    (aligned with default ``classify_tick_regime``: 0.01|1.0 coarse, 0.1|0.001 fine),
+    unless ``custom_tick_regime_override`` is set (e.g. persisted Telegram rule).
     """
     side_u = side.upper()
-    regime = classify_tick_regime(tick)
     meta: dict[str, Any] = {
         "tick_size": tick,
-        "tick_regime": regime,
         "mid": mid,
         "side": side_u,
+        "pricing_mode": pricing_mode,
     }
+
+    if pricing_mode == "custom":
+        if custom_settings is None:
+            meta["tick_regime"] = None
+            meta["reason_code"] = "custom_missing_settings_keep"
+            LOG.warning("pricing_mode=custom but custom_settings is None -> keep")
+            return (
+                AdjustmentDecision("keep", reason="custom_missing_settings_keep"),
+                meta,
+            )
+        creg: CustomTickRegime
+        if custom_tick_regime_override is not None:
+            creg = custom_tick_regime_override
+            meta["custom_tick_regime_source"] = "stored_rule"
+        else:
+            creg = classify_custom_tick_regime(tick)
+            meta["custom_tick_regime_source"] = "live_tick"
+        meta["tick_regime"] = f"custom_{creg}"
+        if creg == "coarse":
+            return _decide_custom_coarse(
+                side_u=side_u,
+                price=price,
+                mid=mid,
+                tick=tick,
+                delta=delta,
+                bids=bids,
+                asks=asks,
+                min_replace_ticks=min_replace_ticks,
+                settings=custom_settings,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                meta=meta,
+            )
+        return _decide_custom_fine(
+            side_u=side_u,
+            price=price,
+            mid=mid,
+            tick=tick,
+            delta=delta,
+            min_replace_ticks=min_replace_ticks,
+            settings=custom_settings,
+            meta=meta,
+        )
+
+    regime = classify_tick_regime(tick)
+    meta["tick_regime"] = regime
 
     if regime == "unsupported":
         meta["candidate_prices"] = []

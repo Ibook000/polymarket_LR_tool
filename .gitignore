@@ -1,5 +1,6 @@
 .env
 .venv/
+custom_pricing_rules.json
 
 # Python
 __pycache__/
