@@ -6,7 +6,7 @@ Python **监控与调价**程序：您在 [Polymarket](https://docs.polymarket.c
 
 @臭臭Panda 推特/X ： https://x.com/Chosmos110
 
-如果不介意，欢迎使用作者的PolyMarket注册链接 ： https://polymarket.com/?r=xiaochouchou
+如果不介意，欢迎使用作者的PolyMarket注册链接（反佣30%，全反） ： https://polymarket.com/?r=xiaochouchou 
 ## 当前策略概要（主循环）
 
 1. **白名单**：若设置 `PASSIVE_TOKEN_WHITELIST`，则仅以环境变量为准（运行中不随挂单变化）。若未设置，则从当前未成交单提取 `token_id`，并默认每 **120 秒**（`PASSIVE_WHITELIST_REFRESH_SEC`）用未成交单刷新，以便启动后新挂的单可被纳入；设为 `0` 则仅在启动时种子一次。
