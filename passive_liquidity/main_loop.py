@@ -50,9 +50,12 @@ from passive_liquidity.reward_monitor import RewardMonitor
 from passive_liquidity.risk_manager import RiskManager
 from passive_liquidity.simple_price_policy import (
     CustomPricingSettings,
+    MultiLayerSettings,
     compute_eligible_band_depth_stats,
     decide_simple_price,
+    decide_multi_layer_price,
     format_eligible_band_depth_summary_zh,
+    group_orders_into_layers,
     order_uses_custom_pricing,
 )
 from passive_liquidity.telegram_command_poller import start_telegram_command_poller
@@ -434,6 +437,16 @@ def main() -> None:
             ),
         ),
         market_display=market_display,
+    )
+
+    multi_layer_settings = MultiLayerSettings(
+        enabled=config.multi_layer_enabled,
+        group_gap_ticks=config.multi_layer_group_gap_ticks,
+        max_levels=config.multi_layer_levels,
+        fine_target_ratios=config.multi_layer_fine_target_ratios,
+        coarse_offsets=config.multi_layer_coarse_offsets,
+        fine_safe_min=config.multi_layer_fine_safe_min,
+        fine_safe_max=config.multi_layer_fine_safe_max,
     )
 
     class _WsSubRef:
@@ -864,6 +877,34 @@ def main() -> None:
                     ),
                 )
 
+                token_side_to_orders: dict[str, list[dict]] = {}
+                if multi_layer_settings.enabled:
+                    for row in cycle_rows:
+                        key = f"{row['token_id']}:{row['side'].upper()}"
+                        if key not in token_side_to_orders:
+                            token_side_to_orders[key] = []
+                        token_side_to_orders[key].append(row)
+
+                    for key, rows in token_side_to_orders.items():
+                        token_id, side = key.rsplit(":", 1)
+                        mid = rows[0]["mid"]
+                        tick = rows[0]["tick"]
+                        order_dicts = [row["o"] for row in rows]
+                        layers = group_orders_into_layers(
+                            order_dicts,
+                            side,
+                            mid,
+                            tick,
+                            multi_layer_settings.group_gap_ticks,
+                            multi_layer_settings.max_levels,
+                        )
+                        for layer_idx, layer in enumerate(layers):
+                            for o in layer:
+                                for row in rows:
+                                    if row["o"] is o:
+                                        row["layer_index"] = layer_idx
+                                        break
+
                 fill_monitor_keys_done: set[str] = set()
                 for row in cycle_rows:
                     o = row["o"]
@@ -1052,23 +1093,48 @@ def main() -> None:
                         settings_for_order = None
                         regime_override = None
 
-                    decision, meta = decide_simple_price(
-                        side=side,
-                        price=price,
-                        mid=mid,
-                        tick=tick,
-                        delta=delta,
-                        bids=book.bids,
-                        asks=book.asks,
-                        min_replace_ticks=config.adjustment_min_replace_ticks,
-                        pricing_mode="custom" if use_custom else "default",
-                        custom_settings=settings_for_order
-                        if use_custom
-                        else None,
-                        best_bid=book.best_bid,
-                        best_ask=book.best_ask,
-                        custom_tick_regime_override=regime_override,
+                    use_multi_layer = (
+                        multi_layer_settings.enabled
+                        and row.get("layer_index", -1) >= 0
+                        and not use_custom
+                        and stored_rule is None
                     )
+
+                    if use_multi_layer:
+                        layer_idx = row.get("layer_index", 0)
+                        decision, meta = decide_multi_layer_price(
+                            side=side,
+                            price=price,
+                            mid=mid,
+                            tick=tick,
+                            delta=delta,
+                            bids=book.bids,
+                            asks=book.asks,
+                            min_replace_ticks=config.adjustment_min_replace_ticks,
+                            layer_index=layer_idx,
+                            settings=multi_layer_settings,
+                            best_bid=book.best_bid,
+                            best_ask=book.best_ask,
+                        )
+                        meta["layer_index"] = layer_idx
+                    else:
+                        decision, meta = decide_simple_price(
+                            side=side,
+                            price=price,
+                            mid=mid,
+                            tick=tick,
+                            delta=delta,
+                            bids=book.bids,
+                            asks=book.asks,
+                            min_replace_ticks=config.adjustment_min_replace_ticks,
+                            pricing_mode="custom" if use_custom else "default",
+                            custom_settings=settings_for_order
+                            if use_custom
+                            else None,
+                            best_bid=book.best_bid,
+                            best_ask=book.best_ask,
+                            custom_tick_regime_override=regime_override,
+                        )
 
                     def _on_replace_post_retry(attempt: int, err: str) -> None:
                         if not telegram.enabled:

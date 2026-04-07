@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -23,6 +23,26 @@ def _parse_custom_order_ids(raw: Optional[str]) -> frozenset[str]:
         return frozenset()
     parts = [p.strip() for p in str(raw).split(",")]
     return frozenset(p for p in parts if p)
+
+
+def _parse_float_list(raw: Optional[str], default: list[float]) -> list[float]:
+    """Parse comma-separated float list, e.g., '0.5,0.4,0.3'."""
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return [float(x.strip()) for x in str(raw).split(",") if x.strip()]
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_int_list(raw: Optional[str], default: list[int]) -> list[int]:
+    """Parse comma-separated int list, e.g., '1,2,3'."""
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+    except (ValueError, TypeError):
+        return default
 
 
 @dataclass
@@ -186,6 +206,17 @@ class PassiveConfig:
     custom_fine_safe_band_min: float = 0.4
     custom_fine_safe_band_max: float = 0.6
     custom_fine_target_band_ratio: float = 0.5
+    # Multi-layer order support: auto-group orders by price gap
+    multi_layer_enabled: bool = False
+    multi_layer_group_gap_ticks: int = 2  # Orders within N ticks are in same layer group
+    multi_layer_levels: int = 3  # Max number of layers to manage
+    # Per-level fine tick target_ratio (list, e.g., [0.5, 0.4, 0.3])
+    multi_layer_fine_target_ratios: list[float] = field(default_factory=lambda: [0.5, 0.4, 0.3])
+    # Per-level coarse tick offset from mid (list, e.g., [1, 2, 3])
+    multi_layer_coarse_offsets: list[int] = field(default_factory=lambda: [1, 2, 3])
+    # Per-level safe band min/max for fine tick (list)
+    multi_layer_fine_safe_min: list[float] = field(default_factory=lambda: [0.4, 0.3, 0.2])
+    multi_layer_fine_safe_max: list[float] = field(default_factory=lambda: [0.6, 0.5, 0.4])
     # JSON path for Telegram /set_rule persisted rules (token_id+side keys).
     custom_rules_store_path: str = ""
 
@@ -512,6 +543,34 @@ class PassiveConfig:
             custom_fine_target_band_ratio=f(
                 "PASSIVE_CUSTOM_FINE_TARGET_RATIO",
                 cls.custom_fine_target_band_ratio,
+            ),
+            multi_layer_enabled=b(
+                "PASSIVE_MULTI_LAYER_ENABLED",
+                cls.multi_layer_enabled,
+            ),
+            multi_layer_group_gap_ticks=i(
+                "PASSIVE_MULTI_LAYER_GROUP_GAP_TICKS",
+                cls.multi_layer_group_gap_ticks,
+            ),
+            multi_layer_levels=i(
+                "PASSIVE_MULTI_LAYER_LEVELS",
+                cls.multi_layer_levels,
+            ),
+            multi_layer_fine_target_ratios=_parse_float_list(
+                os.environ.get("PASSIVE_MULTI_LAYER_FINE_TARGET_RATIOS"),
+                cls.multi_layer_fine_target_ratios,
+            ),
+            multi_layer_coarse_offsets=_parse_int_list(
+                os.environ.get("PASSIVE_MULTI_LAYER_COARSE_OFFSETS"),
+                cls.multi_layer_coarse_offsets,
+            ),
+            multi_layer_fine_safe_min=_parse_float_list(
+                os.environ.get("PASSIVE_MULTI_LAYER_FINE_SAFE_MIN"),
+                cls.multi_layer_fine_safe_min,
+            ),
+            multi_layer_fine_safe_max=_parse_float_list(
+                os.environ.get("PASSIVE_MULTI_LAYER_FINE_SAFE_MAX"),
+                cls.multi_layer_fine_safe_max,
             ),
             custom_rules_store_path=(
                 os.environ.get("PASSIVE_CUSTOM_RULES_PATH", "").strip()

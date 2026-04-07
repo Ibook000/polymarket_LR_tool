@@ -38,6 +38,19 @@ class CustomPricingSettings:
     fine_target_band_ratio: float
 
 
+@dataclass(frozen=True)
+class MultiLayerSettings:
+    """Settings for multi-layer order management."""
+
+    enabled: bool
+    group_gap_ticks: int
+    max_levels: int
+    fine_target_ratios: list[float]
+    coarse_offsets: list[int]
+    fine_safe_min: list[float]
+    fine_safe_max: list[float]
+
+
 def order_uses_custom_pricing(order: dict, custom_order_ids: frozenset[str]) -> bool:
     """True when order id is listed in PASSIVE_CUSTOM_ORDER_IDS."""
     if not custom_order_ids:
@@ -831,3 +844,194 @@ def decide_simple_price(
         AdjustmentDecision("replace", new_price=ideal, reason=rcode),
         meta,
     )
+
+
+def group_orders_into_layers(
+    orders: list[dict],
+    side: str,
+    mid: float,
+    tick: float,
+    group_gap_ticks: int,
+    max_levels: int,
+) -> list[list[dict]]:
+    """
+    Group orders into layers based on price gap from mid.
+
+    For BUY orders: sort by price descending (closest to mid first)
+    For SELL orders: sort by price ascending (closest to mid first)
+
+    Orders within `group_gap_ticks` from the previous layer's boundary are grouped together.
+    """
+    if not orders:
+        return []
+
+    side_u = side.upper()
+    tick_val = float(tick)
+    gap_threshold = tick_val * group_gap_ticks
+
+    order_prices = []
+    for o in orders:
+        p = _price(o)
+        if p > 0:
+            order_prices.append((o, p))
+
+    if side_u == "BUY":
+        order_prices.sort(key=lambda x: -x[1])
+    else:
+        order_prices.sort(key=lambda x: x[1])
+
+    layers: list[list[dict]] = []
+    current_layer: list[dict] = []
+    prev_price: Optional[float] = None
+
+    for o, p in order_prices:
+        if not current_layer:
+            current_layer.append(o)
+            prev_price = p
+            continue
+
+        if prev_price is not None:
+            if side_u == "BUY":
+                gap = prev_price - p
+            else:
+                gap = p - prev_price
+
+            if gap <= gap_threshold + 1e-12:
+                current_layer.append(o)
+                prev_price = p
+            else:
+                if current_layer:
+                    layers.append(current_layer)
+                    if len(layers) >= max_levels:
+                        break
+                current_layer = [o]
+                prev_price = p
+
+    if current_layer:
+        layers.append(current_layer)
+
+    return layers[:max_levels]
+
+
+def get_layer_index_for_order(
+    order: dict,
+    side: str,
+    mid: float,
+    tick: float,
+    group_gap_ticks: int,
+    max_levels: int,
+) -> int:
+    """
+    Determine which layer index (0-based) an order belongs to.
+    Returns -1 if order doesn't fit in any layer.
+    """
+    layers = group_orders_into_layers([order], side, mid, tick, group_gap_ticks, max_levels)
+    if not layers:
+        return -1
+
+    p = _price(order)
+    side_u = side.upper()
+
+    all_orders = []
+    for o in layers:
+        all_orders.extend(o)
+
+    test_layers = group_orders_into_layers(all_orders, side, mid, tick, group_gap_ticks, max_levels)
+
+    for idx, layer in enumerate(test_layers):
+        for o in layer:
+            if abs(_price(o) - p) < 1e-12:
+                return idx
+
+    return -1
+
+
+def decide_multi_layer_price(
+    *,
+    side: str,
+    price: float,
+    mid: float,
+    tick: float,
+    delta: float,
+    bids: list[Any],
+    asks: list[Any],
+    min_replace_ticks: int,
+    layer_index: int,
+    settings: MultiLayerSettings,
+    best_bid: Optional[float] = None,
+    best_ask: Optional[float] = None,
+) -> tuple[AdjustmentDecision, dict[str, Any]]:
+    """
+    Multi-layer pricing: applies different parameters based on layer index.
+    """
+    side_u = side.upper()
+    tick_regime = classify_tick_regime(tick)
+
+    meta: dict[str, Any] = {
+        "tick_size": tick,
+        "mid": mid,
+        "side": side_u,
+        "pricing_mode": "multi_layer",
+        "layer_index": layer_index,
+        "tick_regime": tick_regime,
+    }
+
+    if layer_index < 0 or layer_index >= len(settings.fine_target_ratios):
+        meta["reason_code"] = "multi_layer_invalid_index"
+        LOG.warning(
+            "multi_layer layer_index=%d out of range -> keep",
+            layer_index,
+        )
+        return AdjustmentDecision("keep", reason="multi_layer_invalid_index"), meta
+
+    meta["fine_target_ratio"] = settings.fine_target_ratios[layer_index]
+    meta["coarse_offset"] = settings.coarse_offsets[layer_index] if layer_index < len(settings.coarse_offsets) else settings.coarse_offsets[-1]
+    meta["fine_safe_min"] = settings.fine_safe_min[layer_index] if layer_index < len(settings.fine_safe_min) else settings.fine_safe_min[-1]
+    meta["fine_safe_max"] = settings.fine_safe_max[layer_index] if layer_index < len(settings.fine_safe_max) else settings.fine_safe_max[-1]
+
+    if tick_regime == "coarse":
+        coarse_settings = CustomPricingSettings(
+            coarse_tick_offset_from_mid=int(meta["coarse_offset"]),
+            coarse_allow_top_of_book=True,
+            coarse_min_candidate_levels=1,
+            fine_safe_band_min=meta["fine_safe_min"],
+            fine_safe_band_max=meta["fine_safe_max"],
+            fine_target_band_ratio=meta["fine_target_ratio"],
+        )
+        return _decide_custom_coarse(
+            side_u=side_u,
+            price=price,
+            mid=mid,
+            tick=tick,
+            delta=delta,
+            bids=bids,
+            asks=asks,
+            min_replace_ticks=min_replace_ticks,
+            settings=coarse_settings,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            meta=meta,
+        )
+    elif tick_regime == "fine":
+        fine_settings = CustomPricingSettings(
+            coarse_tick_offset_from_mid=int(meta["coarse_offset"]),
+            coarse_allow_top_of_book=True,
+            coarse_min_candidate_levels=1,
+            fine_safe_band_min=meta["fine_safe_min"],
+            fine_safe_band_max=meta["fine_safe_max"],
+            fine_target_band_ratio=meta["fine_target_ratio"],
+        )
+        return _decide_custom_fine(
+            side_u=side_u,
+            price=price,
+            mid=mid,
+            tick=tick,
+            delta=delta,
+            min_replace_ticks=min_replace_ticks,
+            settings=fine_settings,
+            meta=meta,
+        )
+    else:
+        meta["reason_code"] = "multi_layer_unsupported_tick"
+        LOG.warning("multi_layer tick=%s unsupported -> keep", tick)
+        return AdjustmentDecision("keep", reason="multi_layer_unsupported_tick"), meta

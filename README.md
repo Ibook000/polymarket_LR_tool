@@ -89,6 +89,55 @@ Python **监控与调价**程序：您在 [Polymarket](https://docs.polymarket.c
 
 更细的注释与可选写法见 **`.env.example`**；粗 tick 行为回归见 **`test_simple_price_custom_coarse.py`**。
 
+## 多层订单管理（Multi-Layer）
+
+在默认调价策略之外，程序支持**自动识别并分层管理多层挂单**。适合场景：你在同一 token + 方向上挂了多个价位的订单，希望每层使用不同的调价参数。
+
+### 启用方式
+
+```bash
+PASSIVE_MULTI_LAYER_ENABLED=true
+```
+
+### 工作原理
+
+1. **自动分组**：程序按订单价格间距自动识别层级。同一 token + 方向（BUY/SELL）的订单，若相邻订单间隔 ≤ `PASSIVE_MULTI_LAYER_GROUP_GAP_TICKS` 个 tick，则归为同一层。
+2. **分层调价**：第1层（最接近 mid）使用第1组参数，第2层使用第2组参数，以此类推。
+3. **优先级**：Telegram 规则 > 环境变量自定义 > 多层 > 默认策略
+
+### 环境变量
+
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| **`PASSIVE_MULTI_LAYER_ENABLED`** | 是否启用多层订单管理 | `false` |
+| **`PASSIVE_MULTI_LAYER_GROUP_GAP_TICKS`** | 相邻订单间隔 ≤ N 个 tick 视为同一层 | `2` |
+| **`PASSIVE_MULTI_LAYER_LEVELS`** | 最大管理层数 | `3` |
+| **`PASSIVE_MULTI_LAYER_FINE_TARGET_RATIOS`** | 每层 fine tick 目标比例（逗号分隔） | `0.5,0.4,0.3` |
+| **`PASSIVE_MULTI_LAYER_COARSE_OFFSETS`** | 每层 coarse tick 偏移量 N（逗号分隔） | `1,2,3` |
+| **`PASSIVE_MULTI_LAYER_FINE_SAFE_MIN`** | 每层 fine tick 安全带下界 | `0.4,0.3,0.2` |
+| **`PASSIVE_MULTI_LAYER_FINE_SAFE_MAX`** | 每层 fine tick 安全带上界 | `0.6,0.5,0.4` |
+
+### 示例
+
+假设在 token_A 上挂了 3 层 BUY 单（tick=0.01, mid=0.16）：
+```
+订单1: 价格 0.16 (距 mid 0 tick) → 第1层
+订单2: 价格 0.15 (距订单1 = 1 tick) → 第2层
+订单3: 价格 0.14 (距订单2 = 1 tick) → 第3层
+```
+
+启用多层后：
+- 第1层：`target_ratio=0.5`, `offset=1`（对齐 mid）
+- 第2层：`target_ratio=0.4`, `offset=2`（距 mid 1 tick）
+- 第3层：`target_ratio=0.3`, `offset=3`（距 mid 2 tick）
+
+### 注意事项
+
+- 多层功能**只管理已有订单**，不会自动创建新订单
+- 如果订单设置了 Telegram 自定义规则（`/set_rule`），会优先使用自定义规则
+- 如果订单 ID 在 `PASSIVE_CUSTOM_ORDER_IDS` 中，会使用环境变量的自定义设置
+- 分组基于**价格间距**，不是基于订单创建时间
+
 ## 架构（模块）
 
 | 模块 | 文件 | 职责 |
